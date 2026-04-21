@@ -47,8 +47,8 @@ def cumsum_kernel(
     X,          # Input tensor (batch, seqlen, nheads, dim)
     seqlen,
     dim,
-    stride_out, # (batch, seqlen, nheads, dim)
-    stride_x,   # (batch, seqlen, nheads, dim)
+    stride_out_batch, stride_out_seqlen, stride_out_head, stride_out_dim,
+    stride_x_batch, stride_x_seqlen, stride_x_head, stride_x_dim,
     # Meta-parameters
     BLOCK_S: tl.constexpr,
     BLOCK_D: tl.constexpr,
@@ -59,8 +59,8 @@ def cumsum_kernel(
     pid_b = tl.program_id(axis=2)  # Batch index (one per batch element)
 
     # Offset pointers by batch and head
-    X = X + pid_b * stride_x[0] + pid_h * stride_x[2]
-    OUT = OUT + pid_b * stride_out[0] + pid_h * stride_out[2]
+    X = X + pid_b * stride_x_batch + pid_h * stride_x_head
+    OUT = OUT + pid_b * stride_out_batch + pid_h * stride_out_head
 
     # Compute ranges
     dim_range = pid_d * BLOCK_D + tl.arange(0, BLOCK_D)
@@ -70,7 +70,7 @@ def cumsum_kernel(
     seq_range = tl.arange(0, BLOCK_S)[:, None]  # (BLOCK_S, 1)
 
     # Load input: (seqlen, dim) for this batch and head
-    x_ptrs = X + seq_range * stride_x[1] + dim_range[None, :] * stride_x[3]
+    x_ptrs = X + seq_range * stride_x_seqlen + dim_range[None, :] * stride_x_dim
     x_mask = (seq_range < seqlen) & dim_mask[None, :]
     x_vals = tl.load(x_ptrs, mask=x_mask, other=0.0).to(tl.float32)
 
@@ -78,7 +78,7 @@ def cumsum_kernel(
     cumsum_vals = tl.cumsum(x_vals, axis=0)
 
     # Store output: (seqlen, dim) for this batch and head
-    out_ptrs = OUT + seq_range * stride_out[1] + dim_range[None, :] * stride_out[3]
+    out_ptrs = OUT + seq_range * stride_out_seqlen + dim_range[None, :] * stride_out_dim
     out_mask = (seq_range < seqlen) & dim_mask[None, :]
     tl.store(out_ptrs, cumsum_vals, mask=out_mask)
 
@@ -93,11 +93,11 @@ def angle_dt_fwd_kernel(
     seqlen,
     dim,
     chunk_size,
-    stride_out,     # (batch, seqlen, nheads, dim)
-    stride_out_sum, # (batch, seqlen // chunk_size, nheads, dim)
-    stride_angle,   # (batch, seqlen, nheads, dim)
-    stride_dt,      # (batch, seqlen, nheads)
-    stride_prefix,  # (batch, numchunks, nheads, dim)
+    stride_out_batch, stride_out_seqlen, stride_out_head, stride_out_dim,
+    stride_out_sum_batch, stride_out_sum_chunk, stride_out_sum_head, stride_out_sum_dim,
+    stride_angle_batch, stride_angle_seqlen, stride_angle_head, stride_angle_dim,
+    stride_dt_batch, stride_dt_seqlen, stride_dt_head,
+    stride_prefix_batch, stride_prefix_chunk, stride_prefix_head, stride_prefix_dim,
     # Meta-parameters
     BLOCK_S: tl.constexpr,
     BLOCK_D: tl.constexpr,
@@ -111,14 +111,14 @@ def angle_dt_fwd_kernel(
     pid_h = tl.program_id(axis=0)  # Head index (one per head)
 
     # Offset pointers by batch and head
-    ANGLE = ANGLE + pid_b * stride_angle[0] + pid_h * stride_angle[2]
-    DT = DT + pid_b * stride_dt[0] + pid_h * stride_dt[2]
+    ANGLE = ANGLE + pid_b * stride_angle_batch + pid_h * stride_angle_head
+    DT = DT + pid_b * stride_dt_batch + pid_h * stride_dt_head
     if WRITE_OUTPUT:
-        OUT = OUT + pid_b * stride_out[0] + pid_h * stride_out[2]
+        OUT = OUT + pid_b * stride_out_batch + pid_h * stride_out_head
     if WRITE_CHUNK_SUM:
-        OUT_SUM = OUT_SUM + pid_b * stride_out_sum[0] + pid_h * stride_out_sum[2]
+        OUT_SUM = OUT_SUM + pid_b * stride_out_sum_batch + pid_h * stride_out_sum_head
     if HAS_PREFIX:
-        PREFIX = PREFIX + pid_b * stride_prefix[0] + pid_h * stride_prefix[2]
+        PREFIX = PREFIX + pid_b * stride_prefix_batch + pid_h * stride_prefix_head
 
     # Compute ranges - each block processes exactly chunk_size elements
     seq_start = pid_s * chunk_size
@@ -130,12 +130,12 @@ def angle_dt_fwd_kernel(
     dim_mask = dim_range < dim
 
     # Load angle: (seqlen, dim) for this batch and head
-    angle_ptrs = ANGLE + seq_range[:, None] * stride_angle[1] + dim_range[None, :] * stride_angle[3]
+    angle_ptrs = ANGLE + seq_range[:, None] * stride_angle_seqlen + dim_range[None, :] * stride_angle_dim
     angle_mask = (seq_mask[:, None] & dim_mask[None, :])
     angle_vals = tl.load(angle_ptrs, mask=angle_mask, other=0.0).to(tl.float32)
 
     # Load dt: (seqlen,) for this batch and head
-    dt_ptrs = DT + seq_range * stride_dt[1]
+    dt_ptrs = DT + seq_range * stride_dt_seqlen
     dt_mask = seq_mask
     dt_vals = tl.load(dt_ptrs, mask=dt_mask, other=0.0).to(tl.float32)
 
@@ -165,7 +165,7 @@ def angle_dt_fwd_kernel(
         # Sum over the sequence dimension (axis 0)
         chunk_sum = tl.sum(output_vals, axis=0)  # (BLOCK_D,)
         # Store chunk sum: (seqlen // chunk_size, dim) for this batch and head
-        sum_ptrs = OUT_SUM + pid_s * stride_out_sum[1] + dim_range * stride_out_sum[3]
+        sum_ptrs = OUT_SUM + pid_s * stride_out_sum_chunk + dim_range * stride_out_sum_dim
         sum_mask = dim_mask
         tl.store(sum_ptrs, chunk_sum, mask=sum_mask)
 
@@ -177,13 +177,13 @@ def angle_dt_fwd_kernel(
             # If chunk idx is 0, prefix is 0. If chunk idx is i, read from prefix at location i-1
             if pid_s > 0:
                 # Load prefix for this chunk from location pid_s - 1
-                prefix_ptrs = PREFIX + (pid_s - 1) * stride_prefix[1] + dim_range * stride_prefix[3]
+                prefix_ptrs = PREFIX + (pid_s - 1) * stride_prefix_chunk + dim_range * stride_prefix_dim
                 prefix_mask = dim_mask
                 prefix_vals = tl.load(prefix_ptrs, mask=prefix_mask, other=0.0).to(tl.float32)
                 # Add prefix to all elements in this chunk
                 output_vals = output_vals + prefix_vals[None, :]  # Broadcast prefix across sequence dimension
             # For pid_s == 0, prefix is implicitly 0, so no addition needed
-        out_ptrs = OUT + seq_range[:, None] * stride_out[1] + dim_range[None, :] * stride_out[3]
+        out_ptrs = OUT + seq_range[:, None] * stride_out_seqlen + dim_range[None, :] * stride_out_dim
         out_mask = (seq_mask[:, None] & dim_mask[None, :])
         tl.store(out_ptrs, output_vals, mask=out_mask)
 
@@ -202,13 +202,13 @@ def angle_dt_bwd_kernel(
     seqlen,
     dim,
     chunk_size,
-    stride_grad_dt,     # (batch, seqlen, nheads)
-    stride_grad_angle,  # (batch, seqlen, nheads, dim)
-    stride_grad_sum,    # (batch, seqlen // chunk_size, nheads, dim)
-    stride_grad_out,    # (batch, seqlen, nheads, dim)
-    stride_angle,       # (batch, seqlen, nheads, dim)
-    stride_dt,          # (batch, seqlen, nheads)
-    stride_prefix,      # (batch, numchunks, nheads, dim)
+    stride_grad_dt_batch, stride_grad_dt_seqlen, stride_grad_dt_head,
+    stride_grad_angle_batch, stride_grad_angle_seqlen, stride_grad_angle_head, stride_grad_angle_dim,
+    stride_grad_sum_batch, stride_grad_sum_chunk, stride_grad_sum_head, stride_grad_sum_dim,
+    stride_grad_out_batch, stride_grad_out_seqlen, stride_grad_out_head, stride_grad_out_dim,
+    stride_angle_batch, stride_angle_seqlen, stride_angle_head, stride_angle_dim,
+    stride_dt_batch, stride_dt_seqlen, stride_dt_head,
+    stride_prefix_batch, stride_prefix_chunk, stride_prefix_head, stride_prefix_dim,
     # Meta-parameters
     BLOCK_S: tl.constexpr,
     BLOCK_D: tl.constexpr,
@@ -222,16 +222,16 @@ def angle_dt_bwd_kernel(
     pid_h = tl.program_id(axis=0)  # Head index (one per head)
 
     # Offset pointers by batch and head
-    GRAD_OUT = GRAD_OUT + pid_b * stride_grad_out[0] + pid_h * stride_grad_out[2]
+    GRAD_OUT = GRAD_OUT + pid_b * stride_grad_out_batch + pid_h * stride_grad_out_head
     if WRITE_GRAD:
-        GRAD_DT = GRAD_DT + pid_b * stride_grad_dt[0] + pid_h * stride_grad_dt[2]
-        GRAD_ANGLE = GRAD_ANGLE + pid_b * stride_grad_angle[0] + pid_h * stride_grad_angle[2]
-        DT = DT + pid_b * stride_dt[0] + pid_h * stride_dt[2]
-        ANGLE = ANGLE + pid_b * stride_angle[0] + pid_h * stride_angle[2]
+        GRAD_DT = GRAD_DT + pid_b * stride_grad_dt_batch + pid_h * stride_grad_dt_head
+        GRAD_ANGLE = GRAD_ANGLE + pid_b * stride_grad_angle_batch + pid_h * stride_grad_angle_head
+        DT = DT + pid_b * stride_dt_batch + pid_h * stride_dt_head
+        ANGLE = ANGLE + pid_b * stride_angle_batch + pid_h * stride_angle_head
     if WRITE_CHUNK_SUM:
-        GRAD_SUM = GRAD_SUM + pid_b * stride_grad_sum[0] + pid_h * stride_grad_sum[2]
+        GRAD_SUM = GRAD_SUM + pid_b * stride_grad_sum_batch + pid_h * stride_grad_sum_head
     if HAS_PREFIX:
-        PREFIX = PREFIX + pid_b * stride_prefix[0] + pid_h * stride_prefix[2]
+        PREFIX = PREFIX + pid_b * stride_prefix_batch + pid_h * stride_prefix_head
 
     # Compute ranges - each block processes exactly chunk_size elements
     seq_start = pid_s * chunk_size
@@ -243,7 +243,7 @@ def angle_dt_bwd_kernel(
     dim_mask = dim_range < dim
 
     # Load angle: (seqlen, dim) for this batch and head
-    grad_out_ptrs = GRAD_OUT + seq_range[:, None] * stride_grad_out[1] + dim_range[None, :] * stride_grad_out[3]
+    grad_out_ptrs = GRAD_OUT + seq_range[:, None] * stride_grad_out_seqlen + dim_range[None, :] * stride_grad_out_dim
     grad_out_mask = (seq_mask[:, None] & dim_mask[None, :])
     grad_out_vals = tl.load(grad_out_ptrs, mask=grad_out_mask, other=0.0).to(tl.float32)
 
@@ -253,7 +253,7 @@ def angle_dt_bwd_kernel(
         # Sum over the sequence dimension (axis 0)
         chunk_sum = tl.sum(grad_out_vals, axis=0)  # (BLOCK_D,)
         # Store chunk sum: (seqlen // chunk_size, dim) for this batch and head
-        sum_ptrs = GRAD_SUM + pid_s * stride_grad_sum[1] + dim_range * stride_grad_sum[3]
+        sum_ptrs = GRAD_SUM + pid_s * stride_grad_sum_chunk + dim_range * stride_grad_sum_dim
         sum_mask = dim_mask
         tl.store(sum_ptrs, chunk_sum, mask=sum_mask)
 
@@ -266,7 +266,7 @@ def angle_dt_bwd_kernel(
             # If chunk idx is 0, prefix is 0. If chunk idx is i, read from prefix at location i-1
             if pid_s > 0:
                 # Load prefix for this chunk from location pid_s - 1
-                prefix_ptrs = PREFIX + (pid_s - 1) * stride_prefix[1] + dim_range * stride_prefix[3]
+                prefix_ptrs = PREFIX + (pid_s - 1) * stride_prefix_chunk + dim_range * stride_prefix_dim
                 prefix_mask = dim_mask
                 prefix_vals = tl.load(prefix_ptrs, mask=prefix_mask, other=0.0).to(tl.float32)
                 # Add prefix to all elements in this chunk
@@ -274,12 +274,12 @@ def angle_dt_bwd_kernel(
             # For pid_s == 0, prefix is implicitly 0, so no addition needed
 
         # Load angle: (seqlen, dim) for this batch and head
-        angle_ptrs = ANGLE + seq_range[:, None] * stride_angle[1] + dim_range[None, :] * stride_angle[3]
+        angle_ptrs = ANGLE + seq_range[:, None] * stride_angle_seqlen + dim_range[None, :] * stride_angle_dim
         angle_mask = (seq_mask[:, None] & dim_mask[None, :])
         angle_vals = tl.load(angle_ptrs, mask=angle_mask, other=0.0).to(tl.float32)
 
         # Load dt: (seqlen,) for this batch and head
-        dt_ptrs = DT + seq_range * stride_dt[1]
+        dt_ptrs = DT + seq_range * stride_dt_seqlen
         dt_mask = seq_mask
         dt_vals = tl.load(dt_ptrs, mask=dt_mask, other=0.0).to(tl.float32)  # (BLOCK_S,)
 
@@ -290,7 +290,7 @@ def angle_dt_bwd_kernel(
         dt_grad_vals = tl.sum(dt_grad_vals, axis=1)  # Sum over dim to get (BLOCK_S,)
 
         # Store dt gradients
-        grad_dt_ptrs = GRAD_DT + seq_range * stride_grad_dt[1]
+        grad_dt_ptrs = GRAD_DT + seq_range * stride_grad_dt_seqlen
         grad_dt_mask = seq_mask
         tl.store(grad_dt_ptrs, dt_grad_vals, mask=grad_dt_mask)
 
@@ -299,7 +299,7 @@ def angle_dt_bwd_kernel(
         grad_angle_vals = (3.141592653589793 * dt_vals[:, None]) * d_tanh * grad_out_vals
 
         # Store angle gradients
-        grad_angle_ptrs = GRAD_ANGLE + seq_range[:, None] * stride_grad_angle[1] + dim_range[None, :] * stride_grad_angle[3]
+        grad_angle_ptrs = GRAD_ANGLE + seq_range[:, None] * stride_grad_angle_seqlen + dim_range[None, :] * stride_grad_angle_dim
         grad_angle_mask = (seq_mask[:, None] & dim_mask[None, :])
         tl.store(grad_angle_ptrs, grad_angle_vals, mask=grad_angle_mask)
 
@@ -352,11 +352,11 @@ def apply_angle_dt_fwd(
             seqlen,
             dim,
             chunk_size,
-            (0, 0, 0, 0),  # output_stride
-            output_sum.stride(),
-            angle.stride(),
-            dt.stride(),
-            (0, 0, 0, 0),   # prefix_stride
+            0, 0, 0, 0,  # output strides
+            output_sum.stride(0), output_sum.stride(1), output_sum.stride(2), output_sum.stride(3),
+            angle.stride(0), angle.stride(1), angle.stride(2), angle.stride(3),
+            dt.stride(0), dt.stride(1), dt.stride(2),
+            0, 0, 0, 0,   # prefix strides
             BLOCK_S=BLOCK_S,
             BLOCK_D=BLOCK_D,
             WRITE_OUTPUT=False,
@@ -378,11 +378,11 @@ def apply_angle_dt_fwd(
             seqlen,
             dim,
             chunk_size,
-            output.stride(),  # output_stride
-            (0, 0, 0, 0),     # output_sum_stride
-            angle.stride(),
-            dt.stride(),
-            prefix.stride(),  # prefix_stride
+            output.stride(0), output.stride(1), output.stride(2), output.stride(3),
+            0, 0, 0, 0,     # output_sum strides
+            angle.stride(0), angle.stride(1), angle.stride(2), angle.stride(3),
+            dt.stride(0), dt.stride(1), dt.stride(2),
+            prefix.stride(0), prefix.stride(1), prefix.stride(2), prefix.stride(3),
             BLOCK_S=BLOCK_S,
             BLOCK_D=BLOCK_D,
             WRITE_OUTPUT=True,
@@ -451,13 +451,13 @@ def apply_angle_dt_bwd(
             seqlen,
             dim,
             chunk_size,
-            (0, 0, 0),             # stride_grad_dt
-            (0, 0, 0, 0),          # stride_grad_angle
-            grad_sum.stride(),     # stride_grad_sum
-            grad_out.stride(),     # stride_grad_out
-            angle.stride(),
-            dt.stride(),
-            (0, 0, 0, 0),          # stride_prefix
+            0, 0, 0,             # grad_dt strides
+            0, 0, 0, 0,          # grad_angle strides
+            grad_sum.stride(0), grad_sum.stride(1), grad_sum.stride(2), grad_sum.stride(3),
+            grad_out.stride(0), grad_out.stride(1), grad_out.stride(2), grad_out.stride(3),
+            angle.stride(0), angle.stride(1), angle.stride(2), angle.stride(3),
+            dt.stride(0), dt.stride(1), dt.stride(2),
+            0, 0, 0, 0,          # prefix strides
             BLOCK_S=BLOCK_S,
             BLOCK_D=BLOCK_D,
             WRITE_GRAD=False,      # Don't write grad_dt and grad_angle yet
@@ -481,13 +481,13 @@ def apply_angle_dt_bwd(
             seqlen,
             dim,
             chunk_size,
-            grad_dt.stride(),       # stride_grad_dt
-            grad_angle.stride(),    # stride_grad_angle
-            (0, 0, 0),              # stride_grad_sum
-            grad_out.stride(),      # stride_grad_out
-            angle.stride(),
-            dt.stride(),
-            prefix.stride(),        # stride_prefix
+            grad_dt.stride(0), grad_dt.stride(1), grad_dt.stride(2),
+            grad_angle.stride(0), grad_angle.stride(1), grad_angle.stride(2), grad_angle.stride(3),
+            0, 0, 0, 0,              # grad_sum strides
+            grad_out.stride(0), grad_out.stride(1), grad_out.stride(2), grad_out.stride(3),
+            angle.stride(0), angle.stride(1), angle.stride(2), angle.stride(3),
+            dt.stride(0), dt.stride(1), dt.stride(2),
+            prefix.stride(0), prefix.stride(1), prefix.stride(2), prefix.stride(3),
             BLOCK_S=BLOCK_S,
             BLOCK_D=BLOCK_D,
             WRITE_GRAD=True,        # Write grad_dt and grad_angle
@@ -529,8 +529,8 @@ def apply_cumsum(
             x,
             seqlen,
             dim,
-            output.stride(),
-            x.stride(),
+            output.stride(0), output.stride(1), output.stride(2), output.stride(3),
+            x.stride(0), x.stride(1), x.stride(2), x.stride(3),
             BLOCK_S=BLOCK_S,
             BLOCK_D=BLOCK_D,
         )
