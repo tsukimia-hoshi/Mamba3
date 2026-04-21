@@ -232,7 +232,10 @@ class Mamba3(nn.Module):
         else:
             raise NotImplementedError("Pure Triton prefill path only supports is_mimo=True; SISO path was removed.")
 
-        out = self.out_proj(y.to(x.dtype))
+        out_proj_dtype = self.out_proj.weight.dtype
+        if y.dtype != out_proj_dtype:
+            y = y.to(out_proj_dtype)
+        out = self.out_proj(y)
         return out
     
 

@@ -103,19 +103,21 @@ def mamba3_mimo_triton(
         chunk_size=chunk_size,
         Input_States=None,
         return_final_states=return_state,
+        angles_cumsum=True,
     )
 
-    def _postprocess_output(y: Tensor) -> Tensor:
-        if MIMO_Out is None:
-            return y.unsqueeze(2)  # (B, L, 1, H, P)
-        out_scale = MIMO_Out[:, 0, :]
-        return _head_scale(y, out_scale)
-
     if not return_state:
-        return _postprocess_output(out)
+        if MIMO_Out is None:
+            return out.unsqueeze(2)  # (B, L, 1, H, P)
+        out_scale = MIMO_Out[:, 0, :]
+        return _head_scale(out, out_scale)
 
     y, last_angle, last_state, last_k, last_v, *rest = out
-    y = _postprocess_output(y)
+    if MIMO_Out is None:
+        y = y.unsqueeze(2)  # (B, L, 1, H, P)
+    else:
+        out_scale = MIMO_Out[:, 0, :]
+        y = _head_scale(y, out_scale)
     last_angle = torch.remainder(last_angle + torch.pi, 2 * torch.pi) - torch.pi
     last_k = last_k.unsqueeze(1)  # (B, 1, H, N) to match MIMO cache layout
     return y, last_angle, last_state, last_k, last_v

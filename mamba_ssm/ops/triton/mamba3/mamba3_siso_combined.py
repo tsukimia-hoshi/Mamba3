@@ -71,6 +71,7 @@ class _Mamba3Function(torch.autograd.Function):
         cu_seqlens: Optional[Tensor],
         chunk_size: int,
         return_final_states: bool,
+        angles_cumsum: bool,
     ) -> Tensor | Tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
         """Forward pass: call Triton kernel and save tensors for backward."""
         
@@ -87,13 +88,25 @@ class _Mamba3Function(torch.autograd.Function):
 
         assert all_states_present or all_states_absent, "Input states must be provided together or all be None."
         
-        Angles_Cumsum, Final_Angle_State = angle_dt_fwd(
-            Angles, DT, 
-            init_state=Input_Angle_State, 
-            chunk_size=chunk_size, 
-            return_output_state=True,
-            cu_seqlens=cu_seqlens,
-        )
+        if angles_cumsum:
+            if Input_Angle_State is not None:
+                raise NotImplementedError(
+                    "angles_cumsum=True does not support Input_Angle_State in autograd path."
+                )
+            if cu_seqlens is not None:
+                raise NotImplementedError(
+                    "angles_cumsum=True does not support varlen (cu_seqlens) in autograd path."
+                )
+            Angles_Cumsum = Angles
+            Final_Angle_State = Angles_Cumsum[:, -1, :, :]
+        else:
+            Angles_Cumsum, Final_Angle_State = angle_dt_fwd(
+                Angles, DT,
+                init_state=Input_Angle_State,
+                chunk_size=chunk_size,
+                return_output_state=True,
+                cu_seqlens=cu_seqlens,
+            )
 
         Input_States = (
             (Input_SSM_State, Input_K_State, Input_V_State)
@@ -285,7 +298,90 @@ class _Mamba3Function(torch.autograd.Function):
             None,                   # cu_seqlens (not differentiable)
             None,                   # chunk_size (not differentiable)
             None,                   # return_final_states (not differentiable)
+            None,                   # angles_cumsum (not differentiable)
         )
+
+def _mamba3_siso_inference(
+    Q: Tensor,
+    K: Tensor,
+    V: Tensor,
+    ADT: Tensor,
+    DT: Tensor,
+    Trap: Tensor,
+    Q_bias: Tensor,
+    K_bias: Tensor,
+    Angles: Tensor,
+    D: Optional[Tensor],
+    Z: Optional[Tensor],
+    Input_States: Optional[Tuple[Tensor, Tensor, Tensor, Tensor]],
+    chunk_size: int,
+    return_final_states: bool,
+    cu_seqlens: Optional[Tensor],
+    angles_cumsum: bool,
+) -> Tensor | Tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
+    """Inference-only fast path that avoids autograd.Function overhead."""
+    try:
+        triton.set_allocator(_triton_alloc_fn)
+    except Exception:
+        pass
+
+    Input_Angle_State, Input_SSM_State, Input_K_State, Input_V_State = (
+        Input_States if Input_States is not None else (None, None, None, None)
+    )
+
+    if angles_cumsum:
+        if Input_Angle_State is not None:
+            raise NotImplementedError(
+                "angles_cumsum=True does not support Input_Angle_State in inference fast path."
+            )
+        if cu_seqlens is not None:
+            raise NotImplementedError(
+                "angles_cumsum=True does not support varlen (cu_seqlens) in inference fast path."
+            )
+        Angles_Cumsum = Angles
+        Final_Angle_State = Angles_Cumsum[:, -1, :, :]
+    else:
+        Angles_Cumsum, Final_Angle_State = angle_dt_fwd(
+            Angles,
+            DT,
+            init_state=Input_Angle_State,
+            chunk_size=chunk_size,
+            return_output_state=True,
+            cu_seqlens=cu_seqlens,
+        )
+
+    Kernel_Input_States = (
+        (Input_SSM_State, Input_K_State, Input_V_State)
+        if Input_SSM_State is not None
+        else None
+    )
+
+    Out, _, _, _, _, _, _, _, _, _, Final_States = mamba3_siso_fwd(
+        Q,
+        K,
+        V,
+        ADT,
+        DT,
+        Trap,
+        Q_bias,
+        K_bias,
+        Angles_Cumsum,
+        D,
+        Z,
+        Kernel_Input_States,
+        chunk_size=chunk_size,
+        store_states_adt_outv=False,
+        return_final_states=return_final_states,
+        cu_seqlens=cu_seqlens,
+    )
+
+    if not return_final_states:
+        return Out
+
+    Final_SSM_State = Final_States[0] if Final_States is not None else None
+    Final_K_State = Final_States[1] if Final_States is not None else None
+    Final_V_State = Final_States[2] if Final_States is not None else None
+    return Out, Final_Angle_State, Final_SSM_State, Final_K_State, Final_V_State
 
 
 def mamba3_siso_combined(
@@ -304,6 +400,7 @@ def mamba3_siso_combined(
     chunk_size: int = 64,
     return_final_states: bool = False,
     cu_seqlens: Optional[Tensor] = None,
+    angles_cumsum: bool = False,
 ) -> Tensor | Tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
     """Mamba-3 attention with Triton kernels and automatic differentiation.
 
@@ -387,7 +484,37 @@ def mamba3_siso_combined(
     all_states_absent = (Input_SSM_State is None) and (Input_K_State is None) and (Input_V_State is None) and (Input_Angle_State is None)
     assert all_states_present or all_states_absent, "Input states must be provided together or all be None."
 
+    grad_tensors = [Q, K, V, ADT, DT, Trap, Q_bias, K_bias, Angles]
+    if D is not None:
+        grad_tensors.append(D)
+    if Z is not None:
+        grad_tensors.append(Z)
+    if Input_Angle_State is not None:
+        grad_tensors.extend([Input_Angle_State, Input_SSM_State, Input_K_State, Input_V_State])
+    needs_grad = torch.is_grad_enabled() and any(t.requires_grad for t in grad_tensors)
+
+    if not needs_grad:
+        return _mamba3_siso_inference(
+            Q=Q,
+            K=K,
+            V=V,
+            ADT=ADT,
+            DT=DT,
+            Trap=Trap,
+            Q_bias=Q_bias,
+            K_bias=K_bias,
+            Angles=Angles,
+            D=D,
+            Z=Z,
+            Input_States=Input_States,
+            chunk_size=chunk_size,
+            return_final_states=return_final_states,
+            cu_seqlens=cu_seqlens,
+            angles_cumsum=angles_cumsum,
+        )
+
     return _Mamba3Function.apply(
         Q, K, V, ADT, DT, Trap, Q_bias, K_bias, Angles, D, Z,
-        Input_Angle_State, Input_SSM_State, Input_K_State, Input_V_State, cu_seqlens, chunk_size, return_final_states
+        Input_Angle_State, Input_SSM_State, Input_K_State, Input_V_State, cu_seqlens, chunk_size, return_final_states,
+        angles_cumsum
     )
