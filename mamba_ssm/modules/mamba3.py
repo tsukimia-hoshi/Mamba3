@@ -11,7 +11,6 @@ from mamba_ssm.ops.triton.layernorm_gated import RMSNorm as RMSNormGated
 
 from mamba_ssm.ops.triton.mamba3.mamba3_mimo_combined import mamba3_mimo_combined
 from mamba_ssm.ops.triton.angle_cumsum import angle_dt
-from mamba_ssm.ops.triton.mamba3.mamba3_siso_combined import mamba3_siso_combined
 from mamba_ssm.ops.triton.mamba3.dtype_policy import enforce_cuda_dtype_policy
 
 from mamba_ssm.ops.triton.mamba3.mamba3_mimo_rotary_step import apply_rotary_qk_inference_fwd
@@ -36,7 +35,7 @@ class Mamba3(nn.Module):
         is_outproj_norm=False,
         is_mimo=False,
         mimo_rank=4,
-        mimo_backend="auto",
+        mimo_backend="triton",
         angle_wrap_interval=256,
         #-------------------------------------------
         # Fused kernel and sharding options
@@ -235,33 +234,8 @@ class Mamba3(nn.Module):
                 y = torch.einsum("blrhp,hrp->blhp", y, self.mimo_o)
             y = rearrange(y, "b l h p -> b l (h p)")
         else:
-            y = mamba3_siso_combined(
-                Q=C.squeeze(2),
-                K=B.squeeze(2),
-                V=x,
-                ADT=ADT,
-                DT=DT,
-                Trap=trap,
-                Q_bias=self.C_bias.squeeze(1),
-                K_bias=self.B_bias.squeeze(1),
-                Angles=angles,
-                D=self.D,
-                Z=z if not self.is_outproj_norm else None,
-                chunk_size=self.chunk_size,
-                Input_States=None,
-                return_final_states=ssm_state is not None,
-            )
-            if ssm_state is not None:
-                y, last_angle, last_state, last_k, last_v, *rest = y
-                angle_dt_state.copy_(last_angle)
-                ssm_state.copy_(last_state)
-                k_state.copy_(last_k)
-                v_state.copy_(last_v)
-            y = rearrange(y, "b l h p -> b l (h p)")
-            if self.is_outproj_norm:
-                z = rearrange(z, "b l h p -> b l (h p)")
-                y = self.norm(y, z)
-        
+            raise NotImplementedError("Pure Triton prefill path only supports is_mimo=True; SISO path was removed.")
+
         out = self.out_proj(y.to(x.dtype))
         return out
     
