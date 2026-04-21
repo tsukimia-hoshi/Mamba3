@@ -77,7 +77,7 @@ class _Mamba3Function(torch.autograd.Function):
         if not return_state:
             return Out
         else:
-            Final_Angle = torch.remainder(Angles[:, -1, :, :], 2 * torch.pi).contiguous().detach()
+            Final_Angle = (torch.remainder(Angles[:, -1, :, :] + torch.pi, 2 * torch.pi) - torch.pi).contiguous().detach()
             Final_SSM_State = Final_SSM_State.permute(0, 1, 3, 2).contiguous().detach()
             Final_K = Final_K.contiguous().detach()
             Final_V = V[:, -1, :, :].contiguous().detach()

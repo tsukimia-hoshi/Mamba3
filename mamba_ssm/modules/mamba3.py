@@ -9,9 +9,10 @@ import torch.nn.functional as F
 
 from mamba_ssm.ops.triton.layernorm_gated import RMSNorm as RMSNormGated
 
-from mamba_ssm.ops.tilelang.mamba3.mamba3_mimo import mamba3_mimo as mamba3_mimo_combined
+from mamba_ssm.ops.triton.mamba3.mamba3_mimo_combined import mamba3_mimo_combined
 from mamba_ssm.ops.triton.angle_cumsum import angle_dt
 from mamba_ssm.ops.triton.mamba3.mamba3_siso_combined import mamba3_siso_combined
+from mamba_ssm.ops.triton.mamba3.dtype_policy import enforce_cuda_dtype_policy
 
 from mamba_ssm.ops.triton.mamba3.mamba3_mimo_rotary_step import apply_rotary_qk_inference_fwd
 
@@ -35,6 +36,8 @@ class Mamba3(nn.Module):
         is_outproj_norm=False,
         is_mimo=False,
         mimo_rank=4,
+        mimo_backend="auto",
+        angle_wrap_interval=256,
         #-------------------------------------------
         # Fused kernel and sharding options
         chunk_size=64, # Recommended: 64 for SISO, 64/mimo_rank for MIMO
@@ -57,6 +60,8 @@ class Mamba3(nn.Module):
         self.is_outproj_norm=is_outproj_norm
         self.is_mimo = is_mimo
         self.mimo_rank = mimo_rank
+        self.mimo_backend = mimo_backend
+        self.angle_wrap_interval = angle_wrap_interval
         if not self.is_mimo:
             self.mimo_rank = 1
 
@@ -124,6 +129,11 @@ class Mamba3(nn.Module):
         self.out_proj = nn.Linear(self.d_inner, self.d_model, bias=False, **factory_kwargs)
 
 
+
+    @staticmethod
+    def _wrap_angles_to_pi(angles: torch.Tensor) -> torch.Tensor:
+        return torch.remainder(angles + torch.pi, 2 * torch.pi) - torch.pi
+
     def forward(self, u, seq_idx=None, cu_seqlens=None, inference_params=None):
         """
         u: (batch, seqlen, hidden_dim)
@@ -177,9 +187,18 @@ class Mamba3(nn.Module):
         B = self.B_norm(B)
         C = self.C_norm(C)
         
+        # Enforce runtime dtype policy for CUDA backends
+        enforce_cuda_dtype_policy(x.dtype, op_name="Mamba3.forward")
+
         # Apply Mamba-3 kernel
         if self.is_mimo:
             angles = angle_dt(angles, DT.transpose(-1, -2)) # (B, L, N, S)
+            if (
+                self.angle_wrap_interval is not None
+                and self.angle_wrap_interval > 0
+                and seqlen >= self.angle_wrap_interval
+            ):
+                angles = self._wrap_angles_to_pi(angles)
             y = mamba3_mimo_combined(
                 Q=C,
                 K=B,
@@ -199,6 +218,7 @@ class Mamba3(nn.Module):
                 rotary_dim_divisor=self.rotary_dim_divisor,
                 dtype=x.dtype,
                 return_state=ssm_state is not None,
+                backend=self.mimo_backend,
             )
             if ssm_state is not None:
                 y, last_angle, last_state, last_k, last_v, *rest = y
