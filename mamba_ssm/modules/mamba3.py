@@ -11,11 +11,9 @@ from mamba_ssm.ops.triton.layernorm_gated import RMSNorm as RMSNormGated
 
 from mamba_ssm.ops.triton.mamba3.mamba3_mimo_combined import mamba3_mimo_combined
 from mamba_ssm.ops.triton.angle_cumsum import angle_dt
-from mamba_ssm.ops.triton.mamba3.dtype_policy import enforce_cuda_dtype_policy
 
 from mamba_ssm.ops.triton.mamba3.mamba3_mimo_rotary_step import apply_rotary_qk_inference_fwd
 
-from mamba_ssm.ops.cute.mamba3.mamba3_step_fn import mamba3_step_fn
 
 class Mamba3(nn.Module):
     def __init__(
@@ -186,8 +184,6 @@ class Mamba3(nn.Module):
         B = self.B_norm(B)
         C = self.C_norm(C)
         
-        # Enforce runtime dtype policy for CUDA backends
-        enforce_cuda_dtype_policy(x.dtype, op_name="Mamba3.forward")
 
         # Apply Mamba-3 kernel
         if self.is_mimo:
@@ -274,132 +270,8 @@ class Mamba3(nn.Module):
         return y
 
     def step(self, u, angle_state, ssm_state, k_state, v_state, **kwargs):
-        """
-        Decode function using CuteDSL kernel from mamba3_step_fn.py.
-        Also modify the state vars in-place for the next step.
+        raise NotImplementedError("cutlass/cute decode path removed; only Triton prefill forward/backward is supported.")
 
-        NOTE: Only tested on H100. Compatibility with other hardware
-        will be made available in the future.
-
-        Args:
-            u: (batch, d_model)
-            angle_state: (batch, nheads, num_rope_angles)
-            ssm_state: (batch, nheads, headdim, d_state)
-            k_state: (batch, R, nheads, d_state), where R = mimo_rank (R=1 if not MIMO)
-            v_state: (batch, nheads, headdim)
-            **kwargs: ignored
-        Returns:
-            out: (batch, d_model)
-            nxt_angle_state: (batch, nheads, num_rope_angles)
-            state_out: (batch, nheads, headdim, d_state)
-            nxt_k_state: (batch, R, nheads, d_state), where R = mimo_rank (R=1 if not MIMO)
-            nxt_v_state: (batch, nheads, headdim)
-        """
-
-        # in_proj
-        zxBCdt = self.in_proj(u)
-        z, x, B, C, dd_dt, dd_A, trap, angles = torch.split(
-            zxBCdt,
-            [
-                self.d_inner,
-                self.d_inner,
-                self.d_state * self.num_bc_heads * self.mimo_rank,
-                self.d_state * self.num_bc_heads * self.mimo_rank,
-                self.nheads,
-                self.nheads,
-                self.nheads,
-                self.num_rope_angles,
-            ],
-            dim=-1)
-
-        DT, B, C, x, z, trap, A, angles = self._preprocess(
-            dd_A, dd_dt, B, C, x, z, trap, angles)
-
-        bias_q = rearrange(self.C_bias, "h r n -> r h n")
-        bias_k = rearrange(self.B_bias, "h r n -> r h n")
-
-        # NOTE: MIMO calls the Tilelang kernel, 
-        # which permute the blockwise rotation matrix so that
-        # the i-th entry is paired with the i+N//2-th entry:
-        rotate_pairwise = not self.is_mimo
-        C, B, nxt_angle_state = apply_rotary_qk_inference_fwd(
-            q=C, k=B, angle_state=angle_state, 
-            angle_proj=angles, dt=DT, bias_q=bias_q, bias_k=bias_k, 
-            conjugate=False, inplace=False, # NOTE: inplace is incompatible with self.nheads != self.num_bc_heads
-            rotate_pairwise=rotate_pairwise)
-
-        nxt_v_state = x
-        nxt_k_state = B
-
-        if self.is_mimo:
-            xpj = rearrange(self.mimo_x, "h r p -> r h p", p=self.headdim).contiguous()
-            zpj = rearrange(self.mimo_z, "h r p -> r h p", p=self.headdim).contiguous()
-            outpj = rearrange(self.mimo_o, "h r p -> r h p", p=self.headdim).contiguous()
-        else:
-            xpj = torch.ones(self.mimo_rank, self.nheads, self.headdim, device=x.device, dtype=x.dtype)
-            zpj = torch.ones(self.mimo_rank, self.nheads, self.headdim, device=z.device, dtype=z.dtype)
-            outpj = torch.ones(self.mimo_rank, self.nheads, self.headdim, device=x.device, dtype=x.dtype)
-
-        if self.is_outproj_norm:
-            batch = x.shape[0]
-            y = torch.empty(batch, self.mimo_rank, self.nheads, self.headdim, device=x.device, dtype=x.dtype)
-            mamba3_step_fn(
-                ssm_state,
-                k_state,
-                v_state,
-                A,
-                B,
-                C,
-                self.D,
-                x,
-                DT,
-                trap,
-                xpj,
-                outproj=None,
-                state_out=None, # can be not in place if pass in state_out
-                out=y,
-                z=None,
-                zproj=None,
-                tile_D=64,
-                num_warps=4,
-            )
-            y = self._postprocess(y, outpj, z, zpj, self.headdim)
-        else:
-            y = torch.empty_like(x)
-            mamba3_step_fn(
-                ssm_state,
-                k_state,
-                v_state,
-                A,
-                B,
-                C,
-                self.D,
-                x,
-                DT,
-                trap,
-                xpj,
-                outproj=outpj,
-                state_out=None, # can be not in place if pass in state_out
-                out=y,
-                z=z,
-                zproj=zpj,
-                tile_D=64,
-                num_warps=4,
-            )
-
-        # out_proj
-        out = rearrange(y, "b h p -> b (h p)")
-        out = self.out_proj(out.to(x.dtype))
-
-        angle_state.copy_(nxt_angle_state)
-        # Uncomment the following if mamba3_step_fn is not in place:
-        # state_out = torch.empty_like(ssm_state)
-        # ssm_state.copy_(state_out) 
-        k_state.copy_(nxt_k_state)
-        v_state.copy_(nxt_v_state)
-
-        return out, nxt_angle_state, ssm_state, nxt_k_state, nxt_v_state
-    
     def allocate_inference_cache(self, batch_size, max_seqlen, device=None, dtype=None, inplace_state=None, **kwargs):
         device = self.in_proj.weight.device if device is None else device
         dtype = self.in_proj.weight.dtype if dtype is None else dtype

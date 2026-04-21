@@ -16,7 +16,6 @@ import torch
 from torch import Tensor
 
 from mamba_ssm.ops.triton.mamba3.mamba3_siso_combined import mamba3_siso_combined
-from mamba_ssm.ops.triton.mamba3.dtype_policy import enforce_cuda_dtype_policy
 
 
 @dataclass(frozen=True)
@@ -36,7 +35,6 @@ def _check_triton_runtime(dtype: torch.dtype, chunk_size: int) -> None:
     if chunk_size < 8:
         raise ValueError(f"chunk_size must be >= 8, got {chunk_size}")
 
-    enforce_cuda_dtype_policy(dtype, op_name="mamba3_mimo_triton")
 
 
 def _head_scale(x: Tensor, scale: Tensor) -> Tensor:
